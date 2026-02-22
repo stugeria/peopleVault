@@ -6,8 +6,13 @@ from dotenv import load_dotenv
 import anthropic
 from notion_client import Client as NotionClient
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ConversationHandler, ContextTypes, filters
+)
 from pydantic import BaseModel
+
+from database import init_db, get_user, save_user, delete_user
 
 load_dotenv()
 
@@ -15,9 +20,28 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 claude = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-notion = NotionClient(auth=os.getenv("NOTION_TOKEN"))
-NOTION_DB_ID = os.getenv("NOTION_DATABASE_ID")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+# Conversation states
+NOTION_TOKEN_STATE, DATABASE_ID_STATE = range(2)
+
+SETUP_INSTRUCTIONS = """
+<b>Step 2: Set up your Notion database</b>
+
+1. Create a new full-page <b>database</b> in Notion
+2. Add these <b>Text</b> properties:
+   • Met At
+   • Company
+   • Role
+   • Interests
+   • Family
+   • Notes
+3. Click <b>···</b> → <b>Connections</b> → add your integration
+4. Copy the database ID from the URL:
+   <code>notion.so/[THIS-PART]?v=...</code>
+
+Send me the database ID 👇
+"""
 
 
 class Contact(BaseModel):
@@ -46,11 +70,12 @@ def extract_contact(text: str) -> Contact:
     return response.parsed_output
 
 
-def save_to_notion(contact: Contact) -> str:
+def save_to_notion(contact: Contact, notion_token: str, database_id: str) -> str:
+    notion = NotionClient(auth=notion_token)
+
     properties = {
         "Name": {"title": [{"text": {"content": contact.name}}]},
     }
-
     if contact.met_at:
         properties["Met At"] = {"rich_text": [{"text": {"content": contact.met_at}}]}
     if contact.company:
@@ -65,28 +90,115 @@ def save_to_notion(contact: Contact) -> str:
         properties["Notes"] = {"rich_text": [{"text": {"content": contact.notes}}]}
 
     page = notion.pages.create(
-        parent={"database_id": NOTION_DB_ID},
+        parent={"database_id": database_id},
         properties=properties,
     )
     return page["url"]
 
 
+# --- Setup conversation handlers ---
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_user.id)
+    if user:
+        await update.message.reply_text(
+            "You're all set! Send me a description of someone you met and I'll save them to your Notion.\n\n"
+            "Use /setup to reconnect Notion or /reset to start over."
+        )
+        return ConversationHandler.END
+
     await update.message.reply_text(
-        "👋 Hi! Send me a description of someone you met and I'll save them to Notion.\n\n"
-        "<b>Example:</b>\n"
-        "<i>Met Sarah at John's dinner. Works at Stripe as a PM. Into rock climbing and ceramics. Has a dog named Mochi.</i>",
+        "👋 Welcome to <b>People Tracker</b>!\n\n"
+        "<b>Step 1: Create a Notion Integration</b>\n\n"
+        "1. Go to <a href=\"https://www.notion.so/my-integrations\">notion.so/my-integrations</a>\n"
+        "2. Click <b>New integration</b>\n"
+        "3. Name it anything (e.g. \"People Tracker\")\n"
+        "4. Set type to <b>Internal</b>\n"
+        "5. Copy the <b>Integration Token</b>\n\n"
+        "Send me the token 👇",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    return NOTION_TOKEN_STATE
+
+
+async def setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Let's reconnect your Notion.\n\n"
+        "<b>Step 1:</b> Go to <a href=\"https://www.notion.so/my-integrations\">notion.so/my-integrations</a> "
+        "and copy your integration token.\n\n"
+        "Send me the token 👇",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    return NOTION_TOKEN_STATE
+
+
+async def receive_notion_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    token = update.message.text.strip()
+
+    if not (token.startswith("ntn_") or token.startswith("secret_")):
+        await update.message.reply_text(
+            "❌ That doesn't look like a valid Notion token.\n"
+            "It should start with <code>ntn_</code> or <code>secret_</code>.\n\n"
+            "Try again 👇",
+            parse_mode="HTML",
+        )
+        return NOTION_TOKEN_STATE
+
+    context.user_data["notion_token"] = token
+    await update.message.reply_text(SETUP_INSTRUCTIONS, parse_mode="HTML")
+    return DATABASE_ID_STATE
+
+
+async def receive_database_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    # Strip any accidental URL or query string the user may have pasted
+    database_id = raw.split("?")[0].split("/")[-1].replace("-", "")
+
+    notion_token = context.user_data.get("notion_token")
+
+    try:
+        notion = NotionClient(auth=notion_token)
+        notion.databases.retrieve(database_id)
+    except Exception:
+        await update.message.reply_text(
+            "❌ Couldn't connect to that database. Make sure:\n\n"
+            "1. The database ID is correct\n"
+            "2. You added your integration via <b>Connections</b> on the database page\n\n"
+            "Try sending the ID again 👇",
+            parse_mode="HTML",
+        )
+        return DATABASE_ID_STATE
+
+    save_user(update.effective_user.id, notion_token, database_id)
+    await update.message.reply_text(
+        "✅ <b>All connected!</b>\n\n"
+        "Send me a description of someone you met and I'll save them to your Notion.\n\n"
+        "<i>Example: Met Sarah at John's dinner. Works at Stripe as a PM. Into rock climbing. Has a dog named Mochi.</i>",
         parse_mode="HTML",
     )
+    return ConversationHandler.END
 
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Setup cancelled. Run /start whenever you're ready.")
+    return ConversationHandler.END
+
+
+# --- Main contact handler ---
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+    user = get_user(update.effective_user.id)
+    if not user:
+        await update.message.reply_text("Please run /start to connect your Notion account first.")
+        return
+
     await update.message.reply_text("⏳ Processing...")
 
     try:
-        contact = extract_contact(text)
-        url = save_to_notion(contact)
+        contact = extract_contact(update.message.text)
+        url = save_to_notion(contact, user["notion_token"], user["database_id"])
 
         lines = [f"✅ Saved <b>{contact.name}</b>"]
         if contact.met_at:
@@ -106,13 +218,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.exception("Error processing message")
-        await update.message.reply_text(f"❌ Something went wrong: {str(e)}")
+        await update.message.reply_text(
+            f"❌ Something went wrong: {str(e)}\n\n"
+            "If your Notion token has changed, run /setup to reconnect."
+        )
+
+
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    delete_user(update.effective_user.id)
+    await update.message.reply_text("Your account has been reset. Run /start to reconnect your Notion.")
 
 
 def main():
+    init_db()
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
+
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", start),
+            CommandHandler("setup", setup_command),
+        ],
+        states={
+            NOTION_TOKEN_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_notion_token)],
+            DATABASE_ID_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_database_id)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    app.add_handler(conv_handler)
+    app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
     print("Bot is running. Press Ctrl+C to stop.")
     app.run_polling()
 
