@@ -91,15 +91,11 @@ def fetch_all_contacts(notion_token: str, database_id: str) -> list[dict]:
     cursor = None
 
     while True:
-        body = {}
+        kwargs = {}
         if cursor:
-            body["start_cursor"] = cursor
+            kwargs["start_cursor"] = cursor
 
-        result = notion.request(
-            path=f"databases/{database_id}/query",
-            method="POST",
-            body=body,
-        )
+        result = notion.data_sources.query(database_id, **kwargs)
 
         for page in result["results"]:
             props = page["properties"]
