@@ -86,16 +86,19 @@ def classify_intent(text: str) -> str:
 
 
 def fetch_all_contacts(notion_token: str, database_id: str) -> list[dict]:
-    notion = NotionClient(auth=notion_token)
+    # Use the stable 2022-06-28 API version so /databases/{id}/query is available
+    # regardless of which notion-client version is installed.
+    notion = NotionClient(auth=notion_token, notion_version="2022-06-28")
     contacts = []
     cursor = None
 
     while True:
-        kwargs = {"database_id": database_id}
-        if cursor:
-            kwargs["start_cursor"] = cursor
-
-        result = notion.databases.query(**kwargs)
+        body = {"start_cursor": cursor} if cursor else {}
+        result = notion.request(
+            path=f"databases/{database_id}/query",
+            method="POST",
+            body=body,
+        )
 
         for page in result["results"]:
             props = page["properties"]
