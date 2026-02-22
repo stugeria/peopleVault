@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import Optional, List
+from typing import Optional, List, Literal
 
 from dotenv import load_dotenv
 import anthropic
@@ -52,6 +52,118 @@ class Contact(BaseModel):
     interests: Optional[List[str]] = None
     family: Optional[str] = None
     notes: Optional[str] = None
+
+
+class Intent(BaseModel):
+    type: Literal["save", "search"]
+
+
+class SearchMatch(BaseModel):
+    name: str
+    summary: str
+    reason: str
+
+
+class SearchResponse(BaseModel):
+    matches: List[SearchMatch]
+    no_match_message: Optional[str] = None
+
+
+def classify_intent(text: str) -> str:
+    response = claude.messages.parse(
+        model="claude-opus-4-6",
+        max_tokens=100,
+        system=(
+            "Classify the user's message as either 'save' or 'search'.\n"
+            "'save' means they are describing someone they just met or want to record.\n"
+            "'search' means they are looking for someone already saved (e.g. asking who, find someone, recall a person).\n"
+            "Return only the JSON with the classification."
+        ),
+        messages=[{"role": "user", "content": text}],
+        output_format=Intent,
+    )
+    return response.parsed_output.type
+
+
+def fetch_all_contacts(notion_token: str, database_id: str) -> list[dict]:
+    notion = NotionClient(auth=notion_token)
+    contacts = []
+    cursor = None
+
+    while True:
+        kwargs = {"database_id": database_id}
+        if cursor:
+            kwargs["start_cursor"] = cursor
+
+        result = notion.databases.query(**kwargs)
+
+        for page in result["results"]:
+            props = page["properties"]
+
+            def get_title(prop):
+                parts = prop.get("title", [])
+                return "".join(p["plain_text"] for p in parts) if parts else None
+
+            def get_rich_text(prop):
+                parts = prop.get("rich_text", [])
+                return "".join(p["plain_text"] for p in parts) if parts else None
+
+            contacts.append({
+                "Name": get_title(props.get("Name", {})),
+                "Met At": get_rich_text(props.get("Met At", {})),
+                "Company": get_rich_text(props.get("Company", {})),
+                "Role": get_rich_text(props.get("Role", {})),
+                "Interests": get_rich_text(props.get("Interests", {})),
+                "Family": get_rich_text(props.get("Family", {})),
+                "Notes": get_rich_text(props.get("Notes", {})),
+            })
+
+        if result.get("has_more"):
+            cursor = result["next_cursor"]
+        else:
+            break
+
+    return contacts
+
+
+def search_contacts(query: str, notion_token: str, database_id: str) -> str:
+    contacts = fetch_all_contacts(notion_token, database_id)
+
+    if not contacts:
+        return "Your contact list is empty. Send me a description of someone you met to get started!"
+
+    contacts_text = "\n\n".join(
+        "\n".join(f"{k}: {v}" for k, v in c.items() if v)
+        for c in contacts
+    )
+
+    response = claude.messages.parse(
+        model="claude-opus-4-6",
+        max_tokens=1024,
+        system=(
+            "You are a personal contact search assistant. Given a list of saved contacts and a search query, "
+            "return the most relevant matches. For each match, provide a one-line summary of who they are and "
+            "why they match the query. If no contacts match, set no_match_message to a friendly message instead."
+        ),
+        messages=[{
+            "role": "user",
+            "content": f"Contacts:\n{contacts_text}\n\nSearch query: {query}",
+        }],
+        output_format=SearchResponse,
+    )
+
+    result = response.parsed_output
+
+    if result.no_match_message:
+        return result.no_match_message
+
+    lines = ["<b>Here's who I found:</b>\n"]
+    for match in result.matches:
+        lines.append(f"<b>{match.name}</b>")
+        lines.append(f"{match.summary}")
+        lines.append(f"<i>Why: {match.reason}</i>\n")
+
+    return "\n".join(lines)
 
 
 def extract_contact(text: str) -> Contact:
@@ -111,9 +223,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Welcome to <b>People Tracker</b>!\n\n"
         "<b>Step 1: Create a Notion Integration</b>\n\n"
         "1. Go to <a href=\"https://www.notion.so/my-integrations\">notion.so/my-integrations</a>\n"
-        "2. Click <b>New integration</b>\n"
+        "2. Go to Internal Integrations and Click <b>New integration</b>\n"
         "3. Name it anything (e.g. \"People Tracker\")\n"
-        "4. Set type to <b>Internal</b>\n"
+        "4. Select <b>No User Information</b> in User Capabilities\n"
+        "5. Press <b>Save</b>\n\n"
         "5. Copy the <b>Integration Token</b>\n\n"
         "Send me the token 👇",
         parse_mode="HTML",
@@ -194,34 +307,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please run /start to connect your Notion account first.")
         return
 
-    await update.message.reply_text("⏳ Processing...")
+    text = update.message.text
+    intent = classify_intent(text)
 
-    try:
-        contact = extract_contact(update.message.text)
-        url = save_to_notion(contact, user["notion_token"], user["database_id"])
+    if intent == "search":
+        await update.message.reply_text("🔍 Searching...")
+        try:
+            result = search_contacts(text, user["notion_token"], user["database_id"])
+            await update.message.reply_text(result, parse_mode="HTML")
+        except Exception as e:
+            logger.exception("Error searching contacts")
+            await update.message.reply_text(
+                f"❌ Something went wrong while searching: {str(e)}\n\n"
+                "If your Notion token has changed, run /setup to reconnect."
+            )
+    else:
+        await update.message.reply_text("⏳ Processing...")
+        try:
+            contact = extract_contact(text)
+            url = save_to_notion(contact, user["notion_token"], user["database_id"])
 
-        lines = [f"✅ Saved <b>{contact.name}</b>"]
-        if contact.met_at:
-            lines.append(f"📍 Met at: {contact.met_at}")
-        if contact.role or contact.company:
-            work = " · ".join(filter(None, [contact.role, contact.company]))
-            lines.append(f"💼 Work: {work}")
-        if contact.interests:
-            lines.append(f"🎯 Interests: {', '.join(contact.interests)}")
-        if contact.family:
-            lines.append(f"👨‍👩‍👧 Family: {contact.family}")
-        if contact.notes:
-            lines.append(f"📝 Notes: {contact.notes}")
-        lines.append(f'\n<a href="{url}">View in Notion →</a>')
+            lines = [f"✅ Saved <b>{contact.name}</b>"]
+            if contact.met_at:
+                lines.append(f"📍 Met at: {contact.met_at}")
+            if contact.role or contact.company:
+                work = " · ".join(filter(None, [contact.role, contact.company]))
+                lines.append(f"💼 Work: {work}")
+            if contact.interests:
+                lines.append(f"🎯 Interests: {', '.join(contact.interests)}")
+            if contact.family:
+                lines.append(f"👨‍👩‍👧 Family: {contact.family}")
+            if contact.notes:
+                lines.append(f"📝 Notes: {contact.notes}")
+            lines.append(f'\n<a href="{url}">View in Notion →</a>')
 
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
-    except Exception as e:
-        logger.exception("Error processing message")
-        await update.message.reply_text(
-            f"❌ Something went wrong: {str(e)}\n\n"
-            "If your Notion token has changed, run /setup to reconnect."
-        )
+        except Exception as e:
+            logger.exception("Error processing message")
+            await update.message.reply_text(
+                f"❌ Something went wrong: {str(e)}\n\n"
+                "If your Notion token has changed, run /setup to reconnect."
+            )
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
