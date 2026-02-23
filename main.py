@@ -322,11 +322,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Connecting...")
     try:
         intent = classify_intent(text)
+    except anthropic.APIStatusError as e:
+        logger.exception("Error classifying intent")
+        if e.status_code == 529:
+            await update.message.reply_text("❌ AI service is currently down. Please try again later.")
+        else:
+            await update.message.reply_text("❌ The AI service is temporarily unavailable. Please try again in a moment.")
+        return
     except Exception as e:
         logger.exception("Error classifying intent")
-        await update.message.reply_text(
-            "❌ The AI service is temporarily unavailable. Please try again in a moment."
-        )
+        await update.message.reply_text("❌ The AI service is temporarily unavailable. Please try again in a moment.")
         return
 
     if intent == "search":
@@ -334,6 +339,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             result = search_contacts(text, user["notion_token"], user["database_id"])
             await update.message.reply_text(result, parse_mode="HTML")
+        except anthropic.APIStatusError as e:
+            logger.exception("Error searching contacts")
+            if e.status_code == 529:
+                await update.message.reply_text("❌ AI service is currently down. Please try again later.")
+            else:
+                await update.message.reply_text(
+                    f"❌ Something went wrong while searching: {str(e)}\n\n"
+                    "If your Notion token has changed, run /setup to reconnect."
+                )
         except Exception as e:
             logger.exception("Error searching contacts")
             await update.message.reply_text(
@@ -362,6 +376,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
+        except anthropic.APIStatusError as e:
+            logger.exception("Error processing message")
+            if e.status_code == 529:
+                await update.message.reply_text("❌ AI service is currently down. Please try again later.")
+            else:
+                await update.message.reply_text(
+                    f"❌ Something went wrong: {str(e)}\n\n"
+                    "If your Notion token has changed, run /setup to reconnect."
+                )
         except Exception as e:
             logger.exception("Error processing message")
             await update.message.reply_text(
