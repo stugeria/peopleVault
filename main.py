@@ -1,4 +1,5 @@
 import os
+import time
 import logging
 from typing import Optional, List, Literal
 
@@ -70,19 +71,26 @@ class SearchResponse(BaseModel):
 
 
 def classify_intent(text: str) -> str:
-    response = claude.messages.parse(
-        model="claude-opus-4-6",
-        max_tokens=100,
-        system=(
-            "Classify the user's message as either 'save' or 'search'.\n"
-            "'save' means they are describing someone they just met or want to record.\n"
-            "'search' means they are looking for someone already saved (e.g. asking who, find someone, recall a person).\n"
-            "Return only the JSON with the classification."
-        ),
-        messages=[{"role": "user", "content": text}],
-        output_format=Intent,
-    )
-    return response.parsed_output.type
+    for attempt in range(3):
+        try:
+            response = claude.messages.parse(
+                model="claude-opus-4-6",
+                max_tokens=100,
+                system=(
+                    "Classify the user's message as either 'save' or 'search'.\n"
+                    "'save' means they are describing someone they just met or want to record.\n"
+                    "'search' means they are looking for someone already saved (e.g. asking who, find someone, recall a person).\n"
+                    "Return only the JSON with the classification."
+                ),
+                messages=[{"role": "user", "content": text}],
+                output_format=Intent,
+            )
+            return response.parsed_output.type
+        except anthropic.APIStatusError as e:
+            if e.status_code == 529 and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            raise
 
 
 def fetch_all_contacts(notion_token: str, database_id: str) -> list[dict]:
@@ -311,7 +319,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text
-    intent = classify_intent(text)
+    try:
+        intent = classify_intent(text)
+    except Exception as e:
+        logger.exception("Error classifying intent")
+        await update.message.reply_text(
+            "❌ The AI service is temporarily unavailable. Please try again in a moment."
+        )
+        return
 
     if intent == "search":
         await update.message.reply_text("🔍 Searching...")
