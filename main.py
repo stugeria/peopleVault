@@ -319,6 +319,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text
+    await update.message.reply_text("Connecting...")
     try:
         intent = classify_intent(text)
     except Exception as e:
